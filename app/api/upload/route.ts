@@ -3,6 +3,7 @@ import { auth } from '@clerk/nextjs/server'
 import Papa from 'papaparse'
 import { insertTransaction, clearTransactions } from '@/lib/database'
 import { categorizeTransaction, getTransactionType, parseDate, parseAmount } from '@/lib/categorization'
+import { indexUserTransactions } from '@/lib/rag'
 
 export async function POST(request: NextRequest) {
   try {
@@ -91,6 +92,12 @@ export async function POST(request: NextRequest) {
         errors.push(`Error processing row: ${error}`)
       }
     }
+
+    // Index transactions for RAG (async, don't wait)
+    // This allows semantic search over the user's transactions
+    indexUserTransactions(userId).catch(err => {
+      console.error('Failed to index transactions for RAG:', err)
+    })
 
     return NextResponse.json({
       success: true,

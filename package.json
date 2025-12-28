@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "backfill-embeddings": "npx ts-node scripts/backfill-embeddings.ts"
   },
   "dependencies": {
     "@clerk/nextjs": "^6.36.5",

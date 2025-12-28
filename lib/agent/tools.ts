@@ -1,6 +1,7 @@
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
 import { db, initializeDatabase } from "../database";
+import { augmentQuery, findSimilarTransactions } from "../rag";
 
 // Initialize database
 initializeDatabase();
@@ -392,6 +393,113 @@ export function createComparePeriodsTool(userId: string) {
 }
 
 /**
+ * Create RAG Retrieval Tool - Retrieves similar transactions and context for a query
+ * Uses embeddings and vector similarity search
+ */
+export function createRetrievalTool(userId: string) {
+  return tool(
+    async ({ query, topK }: { query: string; topK?: number }): Promise<string> => {
+      try {
+        const { context, sources } = await augmentQuery(userId, query, {
+          topK: topK || 5,
+          includeSchema: false,
+        });
+
+        if (sources.length === 0) {
+          return JSON.stringify({
+            success: true,
+            message: "No similar transactions found in the vector store.",
+            context: "",
+            sources: [],
+          });
+        }
+
+        return JSON.stringify({
+          success: true,
+          context,
+          sourceCount: sources.length,
+          sources: sources.map(s => ({
+            type: s.type,
+            text: s.text,
+            score: Math.round(s.score * 100) / 100,
+            sourceId: s.sourceId,
+          })),
+        });
+      } catch (error) {
+        return JSON.stringify({
+          success: false,
+          error: error instanceof Error ? error.message : "Retrieval failed",
+        });
+      }
+    },
+    {
+      name: "retrieve_context",
+      description: `Search for similar transactions and relevant context using semantic similarity.
+Use this tool to:
+- Find transactions similar to a description
+- Get context about past spending patterns
+- Find examples of how similar queries were answered
+- Understand categorization patterns
+
+This uses RAG (Retrieval-Augmented Generation) to find semantically similar data.`,
+      schema: z.object({
+        query: z.string().describe("The search query or transaction description to find similar items for"),
+        topK: z.number().optional().describe("Number of results to return (default: 5)"),
+      }),
+    }
+  );
+}
+
+/**
+ * Create Similar Transactions Tool - Find transactions similar to a description
+ * Useful for categorization hints
+ */
+export function createSimilarTransactionsTool(userId: string) {
+  return tool(
+    async ({ description }: { description: string }): Promise<string> => {
+      try {
+        const similar = await findSimilarTransactions(userId, description, 5);
+
+        if (similar.length === 0) {
+          return JSON.stringify({
+            success: true,
+            message: "No similar transactions found.",
+            suggestions: [],
+          });
+        }
+
+        // Get most common category from similar transactions
+        const categoryCounts: Record<string, number> = {};
+        for (const tx of similar) {
+          categoryCounts[tx.category] = (categoryCounts[tx.category] || 0) + 1;
+        }
+        const suggestedCategory = Object.entries(categoryCounts)
+          .sort((a, b) => b[1] - a[1])[0][0];
+
+        return JSON.stringify({
+          success: true,
+          suggestedCategory,
+          similarTransactions: similar,
+          confidence: similar[0]?.score || 0,
+        });
+      } catch (error) {
+        return JSON.stringify({
+          success: false,
+          error: error instanceof Error ? error.message : "Failed to find similar transactions",
+        });
+      }
+    },
+    {
+      name: "find_similar_transactions",
+      description: "Find transactions similar to a given description. Useful for predicting categories or understanding spending patterns.",
+      schema: z.object({
+        description: z.string().describe("The transaction description to find similar items for"),
+      }),
+    }
+  );
+}
+
+/**
  * Create all finance tools for a specific user
  */
 export function createFinanceTools(userId: string) {
@@ -402,6 +510,8 @@ export function createFinanceTools(userId: string) {
     createGetMonthlyTrendsTool(userId),
     createSearchTransactionsTool(userId),
     createComparePeriodsTool(userId),
+    createRetrievalTool(userId),
+    createSimilarTransactionsTool(userId),
   ];
 }
 
