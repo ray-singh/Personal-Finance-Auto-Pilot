@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { auth } from '@clerk/nextjs/server'
 import Papa from 'papaparse'
-import { insertTransaction, clearTransactions } from '@/lib/database'
-import { categorizeTransaction, getTransactionType, parseDate, parseAmount } from '@/lib/categorization'
+import { insertTransaction, clearTransactions } from '@/lib/db/queries'
+import { getTransactionType, parseDate, parseAmount } from '@/lib/categorization'
+import { batchCategorize, CategorizationResult } from '@/lib/smartCategorization'
 import { indexUserTransactions } from '@/lib/rag'
 
 export async function POST(request: NextRequest) {
@@ -44,17 +45,22 @@ export async function POST(request: NextRequest) {
 
     // Clear existing transactions for this user if requested
     if (clearExisting) {
-      clearTransactions(userId)
+      await clearTransactions(userId)
     }
 
     let processedCount = 0
     const errors: string[] = []
 
-    // Process each row
+    // First pass: collect all valid rows for batch categorization
+    const validRows: Array<{
+      date: string
+      description: string
+      amount: string | number
+      account: string
+    }> = []
+
     for (const row of result.data as any[]) {
       try {
-        // Try to identify date, description, and amount columns
-        // Support common CSV formats
         const date = row.Date || row.date || row.DATE || 
                      row['Transaction Date'] || row['Posting Date'] || ''
         
@@ -70,28 +76,53 @@ export async function POST(request: NextRequest) {
           continue
         }
 
-        // Parse and normalize data
-        const parsedDate = parseDate(date)
-        const parsedAmount = parseAmount(amount)
-        const category = categorizeTransaction(description)
-        const transactionType = getTransactionType(parsedAmount)
-
-        // Insert into database with user_id
-        insertTransaction({
-          user_id: userId,
-          date: parsedDate,
+        validRows.push({
+          date,
           description: description.trim(),
-          amount: parsedAmount,
-          category,
-          transaction_type: transactionType,
+          amount,
           account: row.Account || row.account || 'Default',
         })
-
-        processedCount++
       } catch (error) {
         errors.push(`Error processing row: ${error}`)
       }
     }
+
+    // Batch categorize all descriptions at once (much more efficient)
+    const descriptions = validRows.map(r => r.description)
+    const categorizations = await batchCategorize(descriptions)
+
+    // Second pass: insert transactions with categories
+    for (let i = 0; i < validRows.length; i++) {
+      const row = validRows[i]
+      const categorizationResult = categorizations[i]
+
+      try {
+        const parsedDate = parseDate(row.date)
+        const parsedAmount = parseAmount(row.amount)
+        const category = categorizationResult.category
+        const transactionType = getTransactionType(parsedAmount)
+
+        await insertTransaction({
+          userId: userId,
+          date: parsedDate,
+          description: row.description,
+          amount: parsedAmount,
+          category,
+          transactionType: transactionType,
+          account: row.account,
+        })
+
+        processedCount++
+      } catch (error) {
+        errors.push(`Error inserting transaction: ${error}`)
+      }
+    }
+
+    // Count categorization methods used
+    const methodCounts = categorizations.reduce((acc, r) => {
+      acc[r.method] = (acc[r.method] || 0) + 1
+      return acc
+    }, {} as Record<string, number>)
 
     // Index transactions for RAG (async, don't wait)
     // This allows semantic search over the user's transactions
@@ -103,6 +134,12 @@ export async function POST(request: NextRequest) {
       success: true,
       message: `Successfully processed ${processedCount} transactions`,
       processedCount,
+      categorization: {
+        byRule: methodCounts['rule'] || 0,
+        byPattern: methodCounts['pattern'] || 0,
+        byAI: methodCounts['ai'] || 0,
+        uncategorized: methodCounts['default'] || 0,
+      },
       errors: errors.length > 0 ? errors : undefined,
     })
   } catch (error) {

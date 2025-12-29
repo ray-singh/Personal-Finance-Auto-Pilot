@@ -1,74 +1,31 @@
 /**
- * Vector Store Module
+ * Vector Store Module (pgvector)
  * 
- * SQLite-based vector store for RAG (Retrieval-Augmented Generation).
- * Stores embeddings with metadata and provides similarity search.
- * 
- * Uses manual cosine similarity for simplicity and portability.
+ * NeonDB + pgvector-based vector store for RAG.
+ * Uses native Postgres vector similarity search for efficient retrieval.
  */
 
-import { db } from './database'
-import { embedText, cosineSimilarity, formatTransactionForEmbedding } from './embeddings'
+import { eq, and, sql as drizzleSql } from 'drizzle-orm'
+import { db, sql, vectorStore } from './db'
+import { embedText, formatTransactionForEmbedding } from './embeddings'
+import type { DocumentType } from './db/schema'
 
-// Document types for different content
-export type DocumentType = 'transaction' | 'category_rule' | 'query_example' | 'schema'
+export { type DocumentType } from './db/schema'
 
 export interface VectorDocument {
   id: number
   userId: string
   docType: DocumentType
-  sourceId: string | number  // ID of the source record (e.g., transaction id)
+  sourceId: string
   text: string
   embedding: number[]
   metadata: Record<string, unknown>
-  createdAt: string
+  createdAt: Date | null
 }
 
 export interface SearchResult {
   document: VectorDocument
   score: number
-}
-
-/**
- * Initialize the vector store table
- */
-export function initializeVectorStore() {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS vector_store (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id TEXT NOT NULL,
-      doc_type TEXT NOT NULL,
-      source_id TEXT NOT NULL,
-      text TEXT NOT NULL,
-      embedding BLOB NOT NULL,
-      metadata TEXT DEFAULT '{}',
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(user_id, doc_type, source_id)
-    )
-  `)
-
-  // Create indexes for efficient querying
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_vector_store_user_id ON vector_store(user_id);
-    CREATE INDEX IF NOT EXISTS idx_vector_store_doc_type ON vector_store(doc_type);
-    CREATE INDEX IF NOT EXISTS idx_vector_store_user_doctype ON vector_store(user_id, doc_type);
-  `)
-}
-
-/**
- * Serialize embedding array to Buffer for storage
- */
-function serializeEmbedding(embedding: number[]): Buffer {
-  const float32Array = new Float32Array(embedding)
-  return Buffer.from(float32Array.buffer)
-}
-
-/**
- * Deserialize Buffer to embedding array
- */
-function deserializeEmbedding(buffer: Buffer): number[] {
-  const float32Array = new Float32Array(buffer.buffer, buffer.byteOffset, buffer.length / 4)
-  return Array.from(float32Array)
 }
 
 /**
@@ -83,32 +40,24 @@ export async function upsertDocument(
 ): Promise<number> {
   // Generate embedding
   const embedding = await embedText(text)
-  const embeddingBlob = serializeEmbedding(embedding)
+  const embeddingStr = `[${embedding.join(',')}]`
 
-  const stmt = db.prepare(`
+  // Use raw SQL for upsert with pgvector
+  const result = await sql`
     INSERT INTO vector_store (user_id, doc_type, source_id, text, embedding, metadata)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(user_id, doc_type, source_id) DO UPDATE SET
-      text = excluded.text,
-      embedding = excluded.embedding,
-      metadata = excluded.metadata,
-      created_at = CURRENT_TIMESTAMP
-  `)
-
-  const result = stmt.run(
-    userId,
-    docType,
-    String(sourceId),
-    text,
-    embeddingBlob,
-    JSON.stringify(metadata)
-  )
-
-  return result.lastInsertRowid as number
+    VALUES (${userId}, ${docType}, ${String(sourceId)}, ${text}, ${embeddingStr}::vector, ${JSON.stringify(metadata)})
+    ON CONFLICT (user_id, doc_type, source_id) DO UPDATE SET
+      text = EXCLUDED.text,
+      embedding = EXCLUDED.embedding,
+      metadata = EXCLUDED.metadata,
+      created_at = NOW()
+    RETURNING id
+  `
+  return (result[0] as { id: number }).id
 }
 
 /**
- * Upsert multiple documents in batch (more efficient)
+ * Upsert multiple documents in batch
  */
 export async function upsertDocuments(
   documents: Array<{
@@ -125,37 +74,31 @@ export async function upsertDocuments(
   const texts = documents.map(d => d.text)
   const embeddings = await embedTexts(texts)
 
-  const stmt = db.prepare(`
-    INSERT INTO vector_store (user_id, doc_type, source_id, text, embedding, metadata)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(user_id, doc_type, source_id) DO UPDATE SET
-      text = excluded.text,
-      embedding = excluded.embedding,
-      metadata = excluded.metadata,
-      created_at = CURRENT_TIMESTAMP
-  `)
+  const ids: number[] = []
+  
+  // Insert each document
+  for (let i = 0; i < documents.length; i++) {
+    const doc = documents[i]
+    const embeddingStr = `[${embeddings[i].join(',')}]`
+    
+    const result = await sql`
+      INSERT INTO vector_store (user_id, doc_type, source_id, text, embedding, metadata)
+      VALUES (${doc.userId}, ${doc.docType}, ${String(doc.sourceId)}, ${doc.text}, ${embeddingStr}::vector, ${JSON.stringify(doc.metadata || {})})
+      ON CONFLICT (user_id, doc_type, source_id) DO UPDATE SET
+        text = EXCLUDED.text,
+        embedding = EXCLUDED.embedding,
+        metadata = EXCLUDED.metadata,
+        created_at = NOW()
+      RETURNING id
+    `
+    ids.push((result[0] as { id: number }).id)
+  }
 
-  const insertMany = db.transaction((docs: typeof documents) => {
-    const ids: number[] = []
-    docs.forEach((doc, i) => {
-      const result = stmt.run(
-        doc.userId,
-        doc.docType,
-        String(doc.sourceId),
-        doc.text,
-        serializeEmbedding(embeddings[i]),
-        JSON.stringify(doc.metadata || {})
-      )
-      ids.push(result.lastInsertRowid as number)
-    })
-    return ids
-  })
-
-  return insertMany(documents)
+  return ids
 }
 
 /**
- * Search for similar documents using cosine similarity
+ * Search for similar documents using pgvector cosine similarity
  */
 export async function searchSimilar(
   userId: string,
@@ -170,96 +113,105 @@ export async function searchSimilar(
 
   // Generate query embedding
   const queryEmbedding = await embedText(query)
+  const embeddingStr = `[${queryEmbedding.join(',')}]`
 
-  // Build SQL query with optional doc_type filter
-  let sql = `SELECT * FROM vector_store WHERE user_id = ?`
-  const params: (string | number)[] = [userId]
-
+  // Build doc_type filter
+  let docTypeFilter = ''
   if (docTypes && docTypes.length > 0) {
-    const placeholders = docTypes.map(() => '?').join(', ')
-    sql += ` AND doc_type IN (${placeholders})`
-    params.push(...docTypes)
+    docTypeFilter = `AND doc_type IN (${docTypes.map(t => `'${t}'`).join(', ')})`
   }
 
-  const stmt = db.prepare(sql)
-  const rows = stmt.all(...params) as Array<{
+  // Use pgvector's cosine distance operator (<=>)
+  // Convert distance to similarity: 1 - distance
+  const result = await sql.unsafe(`
+    SELECT 
+      id,
+      user_id,
+      doc_type,
+      source_id,
+      text,
+      metadata,
+      created_at,
+      1 - (embedding <=> '${embeddingStr}'::vector) as similarity
+    FROM vector_store
+    WHERE user_id = '${userId}'
+    ${docTypeFilter}
+    ORDER BY embedding <=> '${embeddingStr}'::vector
+    LIMIT ${topK}
+  `)
+
+  // Cast result through unknown to handle type conversion
+  const rows = result as unknown as Array<{
     id: number
     user_id: string
     doc_type: string
     source_id: string
     text: string
-    embedding: Buffer
     metadata: string
-    created_at: string
+    created_at: Date | null
+    similarity: number
   }>
 
-  // Calculate similarity scores
-  const results: SearchResult[] = rows.map(row => {
-    const embedding = deserializeEmbedding(row.embedding)
-    const score = cosineSimilarity(queryEmbedding, embedding)
-    
-    return {
+  // Filter by minimum score and map to SearchResult
+  return rows
+    .filter(row => row.similarity >= minScore)
+    .map(row => ({
       document: {
         id: row.id,
         userId: row.user_id,
         docType: row.doc_type as DocumentType,
         sourceId: row.source_id,
         text: row.text,
-        embedding,
-        metadata: JSON.parse(row.metadata),
+        embedding: [], // Don't return embedding for efficiency
+        metadata: typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata,
         createdAt: row.created_at,
       },
-      score,
-    }
-  })
-
-  // Filter by minimum score and sort by similarity (descending)
-  return results
-    .filter(r => r.score >= minScore)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, topK)
+      score: row.similarity,
+    }))
 }
 
 /**
  * Delete a document from the vector store
  */
-export function deleteDocument(
+export async function deleteDocument(
   userId: string,
   docType: DocumentType,
   sourceId: string | number
-): boolean {
-  const stmt = db.prepare(`
-    DELETE FROM vector_store 
-    WHERE user_id = ? AND doc_type = ? AND source_id = ?
-  `)
-  const result = stmt.run(userId, docType, String(sourceId))
-  return result.changes > 0
+): Promise<boolean> {
+  const result = await db.delete(vectorStore)
+    .where(and(
+      eq(vectorStore.userId, userId),
+      eq(vectorStore.docType, docType),
+      eq(vectorStore.sourceId, String(sourceId))
+    ))
+    .returning({ id: vectorStore.id })
+  return result.length > 0
 }
 
 /**
  * Delete all documents for a user
  */
-export function deleteUserDocuments(userId: string): number {
-  const stmt = db.prepare(`DELETE FROM vector_store WHERE user_id = ?`)
-  const result = stmt.run(userId)
-  return result.changes
+export async function deleteUserDocuments(userId: string): Promise<number> {
+  const result = await db.delete(vectorStore)
+    .where(eq(vectorStore.userId, userId))
+    .returning({ id: vectorStore.id })
+  return result.length
 }
 
 /**
  * Get document count for a user
  */
-export function getDocumentCount(userId: string, docType?: DocumentType): number {
-  let sql = `SELECT COUNT(*) as count FROM vector_store WHERE user_id = ?`
-  const params: string[] = [userId]
-
+export async function getDocumentCount(userId: string, docType?: DocumentType): Promise<number> {
+  let whereClause = eq(vectorStore.userId, userId)
   if (docType) {
-    sql += ` AND doc_type = ?`
-    params.push(docType)
+    whereClause = and(eq(vectorStore.userId, userId), eq(vectorStore.docType, docType))!
   }
 
-  const stmt = db.prepare(sql)
-  const result = stmt.get(...params) as { count: number }
-  return result.count
+  const [result] = await db.select({ count: drizzleSql<number>`count(*)` })
+    .from(vectorStore)
+    .where(whereClause)
+  
+  return Number(result?.count || 0)
 }
 
 /**
@@ -272,17 +224,23 @@ export async function embedTransaction(
     date: string
     description: string
     amount: number
-    category?: string
-    transaction_type?: string
+    category?: string | null
+    transactionType?: string | null
   }
 ): Promise<number> {
-  const text = formatTransactionForEmbedding(transaction)
+  const text = formatTransactionForEmbedding({
+    date: transaction.date,
+    description: transaction.description,
+    amount: transaction.amount,
+    category: transaction.category || undefined,
+    transaction_type: transaction.transactionType || undefined,
+  })
   
   return upsertDocument(userId, 'transaction', transaction.id, text, {
     date: transaction.date,
     amount: transaction.amount,
     category: transaction.category,
-    transaction_type: transaction.transaction_type,
+    transaction_type: transaction.transactionType,
   })
 }
 
@@ -337,6 +295,3 @@ export async function retrieveContext(
     sources: results,
   }
 }
-
-// Initialize on module load
-initializeVectorStore()

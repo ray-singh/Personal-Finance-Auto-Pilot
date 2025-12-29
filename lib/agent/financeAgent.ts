@@ -4,6 +4,9 @@ import { StateGraph, Annotation, END, START } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { createFinanceTools } from "./tools";
 
+import * as dotenv from "dotenv";
+dotenv.config({ path: '.env.local' })
+
 // Define the agent state using Annotation
 const AgentState = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
@@ -69,11 +72,12 @@ function createModel(userId: string) {
 // System prompt for the finance agent
 const SYSTEM_PROMPT = `You are a helpful personal finance assistant that helps users understand and analyze their transaction data.
 
-You have access to a SQLite database containing the user's financial transactions. Your job is to:
+You have access to a PostgreSQL database (NeonDB) containing the user's financial transactions. Your job is to:
 1. Understand the user's question about their finances
 2. Use the appropriate tools to gather data
 3. Analyze the results and provide clear, actionable insights
 4. Suggest visualizations when appropriate
+5. Help users recategorize transactions and improve categorization accuracy
 
 IMPORTANT GUIDELINES:
 - Always be specific with numbers and use proper currency formatting ($X.XX)
@@ -89,6 +93,17 @@ TOOL SELECTION STRATEGY:
 - For "compare" or "trend" questions → use compare_periods or get_monthly_trends
 - For finding specific transactions → use search_transactions
 - For complex custom queries → use sql_query
+- For "recategorize" or "fix categories" → use recategorize_transactions
+- For "what category is..." → use preview_categorization
+- For finding similar transactions → use find_similar_transactions (uses pgvector)
+
+CATEGORIZATION SYSTEM:
+The system uses a smart multi-tier categorization approach:
+1. Rule-based: Exact matches from learned patterns (from user corrections)
+2. Pattern-based: Extended pattern matching for common merchants
+3. AI-powered: GPT-4o-mini fallback for unrecognized merchants
+
+When users correct a category, the system can learn and create rules for future transactions.
 
 When you have enough information to answer, provide a clear, helpful response.`;
 

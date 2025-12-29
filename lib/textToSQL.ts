@@ -1,6 +1,8 @@
 import { OpenAI } from 'openai'
-import { db, getAllTables, getTableSchema } from './database'
+import { getAllTables, getTableSchema, executeRawQuery } from './db/queries'
 import type { ChartData } from '@/types'
+import * as dotenv from "dotenv";
+dotenv.config({ path: '.env.local' })
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -97,18 +99,18 @@ function detectChartType(userQuery: string, results: any[]): ChartData | undefin
  */
 export async function textToSQL(userQuery: string, userId?: string): Promise<QueryResult> {
   try {
-    // Get database schema information
-    const tables = getAllTables()
-    const schemaInfo = tables.map(table => {
-      const columns = getTableSchema(table.name)
+    // Get database schema information (async)
+    const tables = await getAllTables()
+    const schemaInfo = await Promise.all(tables.map(async (table) => {
+      const columns = await getTableSchema(table.name)
       return {
         table: table.name,
         columns: columns.map((col: any) => ({
-          name: col.name,
-          type: col.type,
+          name: col.column_name,
+          type: col.data_type,
         })),
       }
-    })
+    }))
 
     // Create a comprehensive schema description
     const schemaDescription = schemaInfo
@@ -136,16 +138,17 @@ Important Notes:
 
 Rules:
 1. Only generate SELECT queries (no INSERT, UPDATE, DELETE)
-2. Use proper SQLite syntax
+2. Use proper PostgreSQL syntax
 3. Return only the SQL query without explanations or markdown formatting
 4. Use LIMIT to prevent returning too many rows (default 100)
-5. For "this month", use: date >= date('now', 'start of month')
-6. For "last month", use: date >= date('now', '-1 month', 'start of month') AND date < date('now', 'start of month')
+5. For "this month", use: date >= DATE_TRUNC('month', CURRENT_DATE)
+6. For "last month", use: date >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') AND date < DATE_TRUNC('month', CURRENT_DATE)
 7. Always use ABS(amount) when summing expenses to show positive values
 8. When comparing time periods, use Common Table Expressions (CTEs) for clarity
 9. Use ROUND() for monetary values with 2 decimal places
-10. For category queries, use case-insensitive matching with LOWER()
-11. When asked about "spending", focus on negative amounts (expenses)`
+10. For category queries, use case-insensitive matching with ILIKE
+11. When asked about "spending", focus on negative amounts (expenses)
+12. Use TO_CHAR(date, 'YYYY-MM') for monthly grouping`
 
     const userPrompt = `Generate a SQL query to answer this question: "${userQuery}"`
 
@@ -191,9 +194,11 @@ Rules:
       }
     }
 
-    // Execute the SQL query
-    const stmt = db.prepare(sql)
-    const results = stmt.all()
+    // Execute the SQL query using async executeRawQuery
+    // Note: executeRawQuery already injects user_id filter, but we keep the above for safety
+    const results = userId 
+      ? await executeRawQuery(userId, sql)
+      : await executeRawQuery('', sql)
 
     // Detect if results should be charted
     const chartData = detectChartType(userQuery, results)

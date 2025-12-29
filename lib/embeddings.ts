@@ -7,6 +7,8 @@
  */
 
 import OpenAI from 'openai'
+import * as dotenv from "dotenv";
+dotenv.config({ path: '.env.local' })
 
 // Initialize OpenAI client
 const openai = new OpenAI({

@@ -2,13 +2,13 @@
  * RAG (Retrieval-Augmented Generation) Module
  * 
  * High-level interface for RAG operations in the finance app.
- * Provides query augmentation, context retrieval, and response generation
- * with source citations.
+ * Uses NeonDB + Drizzle + pgvector for vector similarity search.
  */
 
 import { retrieveContext, searchSimilar, embedTransaction, upsertDocument, type DocumentType } from './vectorStore'
 import { formatQueryForEmbedding } from './embeddings'
-import { db } from './database'
+import { getTransactions } from './db/queries'
+import type { Transaction } from './db/schema'
 
 export interface RAGResponse {
   augmentedPrompt: string
@@ -54,14 +54,17 @@ export async function augmentQuery(
   let augmentedPrompt = ''
 
   if (includeSchema) {
-    augmentedPrompt += `DATABASE SCHEMA:
+    augmentedPrompt += `DATABASE SCHEMA (PostgreSQL):
 TABLE: transactions
-- id: INTEGER PRIMARY KEY
+- id: SERIAL PRIMARY KEY
+- user_id: TEXT (user identifier)
 - date: TEXT (YYYY-MM-DD format)
 - description: TEXT (merchant/transaction description)
 - amount: REAL (negative for expenses, positive for income)
 - category: TEXT (Coffee, Groceries, Dining, Transportation, etc.)
 - transaction_type: TEXT ('expense' or 'income')
+
+Use PostgreSQL syntax: TO_CHAR(), CURRENT_DATE, DATE_TRUNC(), INTERVAL, ILIKE, etc.
 
 `
   }
@@ -93,20 +96,7 @@ ${context}
  * Call this after bulk import or periodically
  */
 export async function indexUserTransactions(userId: string): Promise<number> {
-  const stmt = db.prepare(`
-    SELECT id, date, description, amount, category, transaction_type
-    FROM transactions
-    WHERE user_id = ?
-  `)
-  
-  const transactions = stmt.all(userId) as Array<{
-    id: number
-    date: string
-    description: string
-    amount: number
-    category: string
-    transaction_type: string
-  }>
+  const transactions = await getTransactions(userId, 10000) // Get all transactions
 
   let indexed = 0
   
@@ -117,7 +107,14 @@ export async function indexUserTransactions(userId: string): Promise<number> {
     
     for (const tx of batch) {
       try {
-        await embedTransaction(userId, tx)
+        await embedTransaction(userId, {
+          id: tx.id,
+          date: tx.date,
+          description: tx.description,
+          amount: tx.amount,
+          category: tx.category,
+          transactionType: tx.transactionType,
+        })
         indexed++
       } catch (error) {
         console.error(`Failed to embed transaction ${tx.id}:`, error)
@@ -143,8 +140,8 @@ export async function indexNewTransaction(
     date: string
     description: string
     amount: number
-    category?: string
-    transaction_type?: string
+    category?: string | null
+    transactionType?: string | null
   }
 ): Promise<void> {
   await embedTransaction(userId, transaction)
@@ -185,48 +182,48 @@ export async function addQueryExamples(
 }
 
 /**
- * Get default NL→SQL examples for bootstrapping
+ * Get default NL→SQL examples for bootstrapping (PostgreSQL syntax)
  */
 export function getDefaultQueryExamples(): QueryExample[] {
   return [
     {
       naturalLanguage: "How much did I spend on coffee this month?",
-      sql: "SELECT SUM(ABS(amount)) as total FROM transactions WHERE category = 'Coffee' AND date >= date('now', 'start of month') AND user_id = ?",
+      sql: "SELECT SUM(ABS(amount)) as total FROM transactions WHERE category = 'Coffee' AND date >= DATE_TRUNC('month', CURRENT_DATE)::text",
       explanation: "Sum absolute amount for Coffee category in current month",
     },
     {
       naturalLanguage: "What are my top 5 expense categories?",
-      sql: "SELECT category, SUM(ABS(amount)) as total FROM transactions WHERE amount < 0 AND user_id = ? GROUP BY category ORDER BY total DESC LIMIT 5",
+      sql: "SELECT category, SUM(ABS(amount)) as total FROM transactions WHERE amount < 0 GROUP BY category ORDER BY total DESC LIMIT 5",
       explanation: "Group expenses by category, sum amounts, order by total descending",
     },
     {
       naturalLanguage: "Show my spending trend by month",
-      sql: "SELECT strftime('%Y-%m', date) as month, SUM(ABS(amount)) as total FROM transactions WHERE amount < 0 AND user_id = ? GROUP BY month ORDER BY month",
+      sql: "SELECT TO_CHAR(date::date, 'YYYY-MM') as month, SUM(ABS(amount)) as total FROM transactions WHERE amount < 0 GROUP BY month ORDER BY month",
       explanation: "Group expenses by month, show trend over time",
     },
     {
       naturalLanguage: "What did I spend at restaurants last week?",
-      sql: "SELECT SUM(ABS(amount)) as total FROM transactions WHERE category = 'Dining' AND date >= date('now', '-7 days') AND user_id = ?",
+      sql: "SELECT SUM(ABS(amount)) as total FROM transactions WHERE category = 'Dining' AND date >= (CURRENT_DATE - INTERVAL '7 days')::text",
       explanation: "Sum Dining category for last 7 days",
     },
     {
       naturalLanguage: "List my largest purchases",
-      sql: "SELECT date, description, ABS(amount) as amount, category FROM transactions WHERE amount < 0 AND user_id = ? ORDER BY ABS(amount) DESC LIMIT 10",
+      sql: "SELECT date, description, ABS(amount) as amount, category FROM transactions WHERE amount < 0 ORDER BY ABS(amount) DESC LIMIT 10",
       explanation: "Order expenses by absolute amount descending, limit to 10",
     },
     {
       naturalLanguage: "How much income did I receive this year?",
-      sql: "SELECT SUM(amount) as total FROM transactions WHERE amount > 0 AND date >= date('now', 'start of year') AND user_id = ?",
+      sql: "SELECT SUM(amount) as total FROM transactions WHERE amount > 0 AND date >= DATE_TRUNC('year', CURRENT_DATE)::text",
       explanation: "Sum positive amounts (income) for current year",
     },
     {
       naturalLanguage: "Compare my spending this month vs last month",
-      sql: "SELECT 'This Month' as period, SUM(ABS(amount)) as total FROM transactions WHERE amount < 0 AND date >= date('now', 'start of month') AND user_id = ? UNION ALL SELECT 'Last Month', SUM(ABS(amount)) FROM transactions WHERE amount < 0 AND date >= date('now', '-1 month', 'start of month') AND date < date('now', 'start of month') AND user_id = ?",
+      sql: "SELECT 'This Month' as period, SUM(ABS(amount)) as total FROM transactions WHERE amount < 0 AND date >= DATE_TRUNC('month', CURRENT_DATE)::text UNION ALL SELECT 'Last Month', SUM(ABS(amount)) FROM transactions WHERE amount < 0 AND date >= (DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month')::text AND date < DATE_TRUNC('month', CURRENT_DATE)::text",
       explanation: "Use UNION to compare current month vs previous month spending",
     },
     {
       naturalLanguage: "What subscriptions do I have?",
-      sql: "SELECT description, amount, date FROM transactions WHERE category = 'Subscriptions' AND user_id = ? ORDER BY date DESC LIMIT 20",
+      sql: "SELECT description, amount, date FROM transactions WHERE category = 'Subscriptions' ORDER BY date DESC LIMIT 20",
       explanation: "List recent subscription transactions",
     },
   ]

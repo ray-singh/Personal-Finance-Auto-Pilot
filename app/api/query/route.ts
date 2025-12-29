@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { auth } from '@clerk/nextjs/server'
 import { runFinanceAgent } from '@/lib/agent'
+import * as dotenv from "dotenv";
+dotenv.config({ path: '.env.local' })
 
 export async function POST(request: NextRequest) {
   try {

@@ -45,7 +45,8 @@ An AI Agent-powered financial assistant that allows users to upload bank stateme
 | **Language** | TypeScript 5.3 | Type-safe development |
 | **Authentication** | Clerk | Secure user authentication & management |
 | **Styling** | Tailwind CSS | Utility-first CSS framework |
-| **Database** | SQLite (better-sqlite3) | Lightweight, serverless database |
+| **Database** | NeonDB + Drizzle ORM | Serverless PostgreSQL with type-safe ORM |
+| **Vector Search** | pgvector | Native PostgreSQL vector similarity search |
 | **AI/ML** | OpenAI GPT-4o-mini | Text-to-SQL generation & NL responses |
 | **Agent Framework** | LangChain + LangGraph | Multi-agent orchestration & tool calling |
 | **Visualization** | Recharts | Interactive charts and graphs |
@@ -87,6 +88,9 @@ npm run dev
    # OpenAI API Key
    OPENAI_API_KEY=sk-proj-...your-key-here
    
+   # NeonDB Database URL (get from console.neon.tech)
+   DATABASE_URL=postgresql://user:password@ep-cool-name-123456.us-east-1.aws.neon.tech/neondb?sslmode=require
+   
    # Clerk Authentication Keys
    NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...
    CLERK_SECRET_KEY=sk_test_...
@@ -95,8 +99,14 @@ npm run dev
    **Get your API keys:**
    - OpenAI: https://platform.openai.com/api-keys
    - Clerk: https://dashboard.clerk.com
+   - NeonDB: https://console.neon.tech
 
-4. **Configure Clerk Authentication** (First-time setup)
+4. **Push database schema to NeonDB**
+   ```bash
+   npm run db:push
+   ```
+
+5. **Configure Clerk Authentication** (First-time setup)
    - Go to https://dashboard.clerk.com
    - Create a new application
    - Select "Email" and "Google" (or your preferred authentication methods)

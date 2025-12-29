@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { auth } from '@clerk/nextjs/server'
-import { db } from '@/lib/database'
+import { db, transactions, categoryRules } from '@/lib/db'
+import { 
+  getCategoryRules, 
+  insertCategoryRule, 
+  deleteCategoryRule as deleteCategoryRuleQuery 
+} from '@/lib/db/queries'
+import { eq, and, like, sql } from 'drizzle-orm'
 
 export async function GET() {
   try {
@@ -13,8 +19,7 @@ export async function GET() {
       )
     }
 
-    const stmt = db.prepare('SELECT * FROM category_rules ORDER BY category, pattern')
-    const rules = stmt.all()
+    const rules = await getCategoryRules()
 
     return NextResponse.json({ rules })
   } catch (error) {
@@ -46,26 +51,28 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const stmt = db.prepare(`
-      INSERT INTO category_rules (pattern, category) VALUES (?, ?)
-    `)
-    const result = stmt.run(pattern.toUpperCase(), category)
+    const rule = await insertCategoryRule({
+      pattern: pattern.toUpperCase(),
+      category,
+    })
 
     // Re-categorize existing transactions with this pattern (only for this user)
-    const updateStmt = db.prepare(`
-      UPDATE transactions 
-      SET category = ? 
-      WHERE UPPER(description) LIKE ? AND user_id = ?
-    `)
-    const updateResult = updateStmt.run(category, `%${pattern.toUpperCase()}%`, userId)
+    // Use PostgreSQL ILIKE for case-insensitive matching
+    const updateResult = await db.update(transactions)
+      .set({ category })
+      .where(and(
+        eq(transactions.userId, userId),
+        like(sql`UPPER(description)`, `%${pattern.toUpperCase()}%`)
+      ))
+      .returning({ id: transactions.id })
 
     return NextResponse.json({
       success: true,
-      ruleId: result.lastInsertRowid,
-      transactionsUpdated: updateResult.changes,
+      ruleId: rule.id,
+      transactionsUpdated: updateResult.length,
     })
   } catch (error: any) {
-    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+    if (error.code === '23505') { // PostgreSQL unique violation
       return NextResponse.json(
         { error: 'This pattern already exists' },
         { status: 400 }
@@ -100,12 +107,11 @@ export async function DELETE(request: NextRequest) {
       )
     }
 
-    const stmt = db.prepare('DELETE FROM category_rules WHERE id = ?')
-    const result = stmt.run(parseInt(id))
+    const deleted = await deleteCategoryRuleQuery(parseInt(id))
 
     return NextResponse.json({
       success: true,
-      deleted: result.changes > 0,
+      deleted,
     })
   } catch (error) {
     console.error('Delete category error:', error)

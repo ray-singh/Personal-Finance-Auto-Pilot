@@ -1,6 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { auth } from '@clerk/nextjs/server'
-import { db } from '@/lib/database'
+import { db, transactions } from '@/lib/db'
+import { 
+  getTransactionCount, 
+  deleteTransaction as deleteTransactionQuery, 
+  clearTransactions,
+  updateTransaction as updateTransactionQuery 
+} from '@/lib/db/queries'
+import { eq, and, gte, lte, like, desc, asc, sql } from 'drizzle-orm'
 
 export async function GET(request: NextRequest) {
   try {
@@ -23,61 +30,63 @@ export async function GET(request: NextRequest) {
     const sortBy = searchParams.get('sortBy') || 'date'
     const sortOrder = searchParams.get('sortOrder') || 'DESC'
 
-    // Build query dynamically - always filter by user_id
-    let whereConditions: string[] = ['user_id = ?']
-    let params: any[] = [userId]
+    // Build conditions array for Drizzle query
+    const conditions = [eq(transactions.userId, userId)]
 
     if (category) {
-      whereConditions.push('category = ?')
-      params.push(category)
+      conditions.push(eq(transactions.category, category))
     }
 
     if (startDate) {
-      whereConditions.push('date >= ?')
-      params.push(startDate)
+      conditions.push(gte(transactions.date, startDate))
     }
 
     if (endDate) {
-      whereConditions.push('date <= ?')
-      params.push(endDate)
+      conditions.push(lte(transactions.date, endDate))
     }
 
     if (search) {
-      whereConditions.push('description LIKE ?')
-      params.push(`%${search}%`)
+      conditions.push(like(transactions.description, `%${search}%`))
     }
-
-    const whereClause = `WHERE ${whereConditions.join(' AND ')}`
 
     // Validate sortBy to prevent SQL injection
     const validSortColumns = ['date', 'amount', 'description', 'category', 'id']
     const safeSortBy = validSortColumns.includes(sortBy) ? sortBy : 'date'
     const safeSortOrder = sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC'
 
-    // Get total count
-    const countStmt = db.prepare(`SELECT COUNT(*) as total FROM transactions ${whereClause}`)
-    const countResult = countStmt.get(...params) as { total: number }
+    // Get sorting column reference
+    const sortColumn = safeSortBy === 'date' ? transactions.date
+      : safeSortBy === 'amount' ? transactions.amount
+      : safeSortBy === 'description' ? transactions.description
+      : safeSortBy === 'category' ? transactions.category
+      : transactions.id
 
-    // Get transactions
-    const query = `
-      SELECT * FROM transactions 
-      ${whereClause}
-      ORDER BY ${safeSortBy} ${safeSortOrder}
-      LIMIT ? OFFSET ?
-    `
-    const stmt = db.prepare(query)
-    const transactions = stmt.all(...params, limit, offset)
+    // Get total count
+    const [countResult] = await db.select({ total: sql<number>`count(*)` })
+      .from(transactions)
+      .where(and(...conditions))
+
+    // Get transactions with sorting
+    const orderFn = safeSortOrder === 'ASC' ? asc : desc
+    const transactionResults = await db.select()
+      .from(transactions)
+      .where(and(...conditions))
+      .orderBy(orderFn(sortColumn))
+      .limit(limit)
+      .offset(offset)
 
     // Get available categories for filtering (user-specific)
-    const categoriesStmt = db.prepare('SELECT DISTINCT category FROM transactions WHERE user_id = ? ORDER BY category')
-    const categories = categoriesStmt.all(userId) as Array<{ category: string }>
+    const categoriesResult = await db.selectDistinct({ category: transactions.category })
+      .from(transactions)
+      .where(eq(transactions.userId, userId))
+      .orderBy(asc(transactions.category))
 
     return NextResponse.json({
-      transactions,
-      total: countResult.total,
+      transactions: transactionResults,
+      total: Number(countResult?.total || 0),
       limit,
       offset,
-      categories: categories.map(c => c.category),
+      categories: categoriesResult.map(c => c.category),
     })
   } catch (error) {
     console.error('Transactions error:', error)
@@ -104,22 +113,20 @@ export async function DELETE(request: NextRequest) {
 
     if (id) {
       // Delete single transaction (only if it belongs to this user)
-      const stmt = db.prepare('DELETE FROM transactions WHERE id = ? AND user_id = ?')
-      const result = stmt.run(parseInt(id), userId)
+      const deleted = await deleteTransactionQuery(parseInt(id), userId)
       return NextResponse.json({ 
         success: true, 
-        message: `Deleted ${result.changes} transaction(s)` 
+        message: deleted ? 'Deleted 1 transaction' : 'Transaction not found' 
       })
     }
 
     // Delete all transactions for this user
     const deleteAll = searchParams.get('deleteAll') === 'true'
     if (deleteAll) {
-      const stmt = db.prepare('DELETE FROM transactions WHERE user_id = ?')
-      const result = stmt.run(userId)
+      const count = await clearTransactions(userId)
       return NextResponse.json({ 
         success: true, 
-        message: `All ${result.changes} transactions deleted` 
+        message: `All ${count} transactions deleted` 
       })
     }
 
@@ -148,7 +155,7 @@ export async function PATCH(request: NextRequest) {
     }
 
     const body = await request.json()
-    const { id, category, description } = body
+    const { id, category, description, learnFromCorrection } = body
 
     if (!id) {
       return NextResponse.json(
@@ -157,20 +164,17 @@ export async function PATCH(request: NextRequest) {
       )
     }
 
-    const updates: string[] = []
-    const params: any[] = []
+    const updates: Partial<{ category: string; description: string }> = {}
 
     if (category !== undefined) {
-      updates.push('category = ?')
-      params.push(category)
+      updates.category = category
     }
 
     if (description !== undefined) {
-      updates.push('description = ?')
-      params.push(description)
+      updates.description = description
     }
 
-    if (updates.length === 0) {
+    if (Object.keys(updates).length === 0) {
       return NextResponse.json(
         { error: 'No updates provided' },
         { status: 400 }
@@ -178,13 +182,29 @@ export async function PATCH(request: NextRequest) {
     }
 
     // Only update if transaction belongs to this user
-    params.push(id, userId)
-    const stmt = db.prepare(`UPDATE transactions SET ${updates.join(', ')} WHERE id = ? AND user_id = ?`)
-    const result = stmt.run(...params)
+    const result = await updateTransactionQuery(parseInt(id), userId, updates)
+
+    // If category was changed and learning is requested, create a rule
+    let ruleCreated = false
+    let rulePattern: string | undefined
+    
+    if (result && category !== undefined && learnFromCorrection) {
+      try {
+        // Import dynamically to avoid circular deps
+        const { learnFromCorrection: learn } = await import('@/lib/smartCategorization')
+        const learningResult = await learn(result.description, category, true)
+        ruleCreated = learningResult.ruleCreated
+        rulePattern = learningResult.pattern
+      } catch (e) {
+        console.error('Failed to learn from correction:', e)
+      }
+    }
 
     return NextResponse.json({
       success: true,
-      message: `Updated ${result.changes} transaction(s)`,
+      message: result ? 'Updated 1 transaction' : 'Transaction not found',
+      ruleCreated,
+      rulePattern,
     })
   } catch (error) {
     console.error('Update error:', error)

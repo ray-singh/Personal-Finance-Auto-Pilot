@@ -1,4 +1,4 @@
-#!/usr/bin/env npx ts-node
+#!/usr/bin/env npx tsx
 /**
  * Backfill Embeddings Script
  * 
@@ -6,7 +6,7 @@
  * Run this once after implementing RAG to index historical data.
  * 
  * Usage:
- *   npx ts-node scripts/backfill-embeddings.ts [--user-id <userId>] [--batch-size <n>]
+ *   npm run backfill-embeddings -- [--user-id <userId>] [--batch-size <n>]
  * 
  * Options:
  *   --user-id    Process only a specific user (default: all users)
@@ -14,8 +14,7 @@
  *   --dry-run    Show what would be processed without making changes
  */
 
-import { db, initializeDatabase } from '../lib/database'
-import { initializeVectorStore } from '../lib/vectorStore'
+import { sql as neonSql } from '../lib/db'
 import { indexUserTransactions, addQueryExamples, getDefaultQueryExamples } from '../lib/rag'
 
 // Parse command line arguments
@@ -31,11 +30,7 @@ const getBatchSize = (): number => {
 const isDryRun = args.includes('--dry-run')
 
 async function main() {
-  console.log('🚀 Starting embeddings backfill...\n')
-  
-  // Initialize database and vector store
-  initializeDatabase()
-  initializeVectorStore()
+  console.log('Starting embeddings backfill...\n')
   
   const specificUserId = getUserIdArg()
   const batchSize = getBatchSize()
@@ -50,9 +45,8 @@ async function main() {
   if (specificUserId) {
     userIds = [specificUserId]
   } else {
-    const stmt = db.prepare(`SELECT DISTINCT user_id FROM transactions WHERE user_id != ''`)
-    const rows = stmt.all() as Array<{ user_id: string }>
-    userIds = rows.map(r => r.user_id)
+    const rows = await neonSql`SELECT DISTINCT user_id FROM transactions WHERE user_id != ''`
+    userIds = (rows as unknown as Array<{ user_id: string }>).map(r => r.user_id)
   }
 
   if (userIds.length === 0) {
@@ -66,11 +60,10 @@ async function main() {
   let totalExamples = 0
 
   for (const userId of userIds) {
-    console.log(`\n📊 Processing user: ${userId.substring(0, 12)}...`)
+    console.log(`\n Processing user: ${userId.substring(0, 12)}...`)
     
     // Get transaction count for this user
-    const countStmt = db.prepare(`SELECT COUNT(*) as count FROM transactions WHERE user_id = ?`)
-    const { count } = countStmt.get(userId) as { count: number }
+    const [{ count }] = await neonSql`SELECT COUNT(*) as count FROM transactions WHERE user_id = ${userId}` as [{ count: number }]
     
     console.log(`   Found ${count} transactions`)
     
@@ -107,8 +100,7 @@ async function main() {
   
   if (!isDryRun) {
     // Show vector store stats
-    const vectorStmt = db.prepare(`SELECT COUNT(*) as count FROM vector_store`)
-    const { count: vectorCount } = vectorStmt.get() as { count: number }
+    const [{ count: vectorCount }] = await neonSql`SELECT COUNT(*) as count FROM vector_store` as [{ count: number }]
     console.log(`\n📦 Vector store now contains ${vectorCount} documents.`)
   }
 

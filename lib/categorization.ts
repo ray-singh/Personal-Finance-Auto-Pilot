@@ -1,4 +1,4 @@
-import { getCategoryRules } from './database'
+import { getCategoryRules } from './db/queries'
 
 export interface TransactionRow {
   date: string
@@ -36,8 +36,8 @@ const EXTENDED_PATTERNS: Record<string, string[]> = {
  * Autonomous categorization using enhanced pattern matching
  * This function matches transaction descriptions against known patterns
  */
-export function categorizeTransaction(description: string): string {
-  const rules = getCategoryRules()
+export async function categorizeTransaction(description: string): Promise<string> {
+  const rules = await getCategoryRules()
   const upperDesc = description.toUpperCase()
 
   // First try database rules (user-customizable)

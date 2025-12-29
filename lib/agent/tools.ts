@@ -1,60 +1,45 @@
+/**
+ * Agent Tools Module (Drizzle/NeonDB/Postgres)
+ * 
+ * Provides LangChain tools for the AI agent to interact with the database.
+ * Uses Drizzle ORM with NeonDB (Postgres) and pgvector for RAG.
+ */
+
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
-import { db, initializeDatabase } from "../database";
+import { sql } from "../db";
+import { 
+  getTransactions, 
+  getSpendingByCategory, 
+  getFinancialSummary, 
+  getMonthlyTrends,
+  searchTransactions,
+  executeRawQuery 
+} from "../db/queries";
 import { augmentQuery, findSimilarTransactions } from "../rag";
-
-// Initialize database
-initializeDatabase();
+import { 
+  smartCategorize, 
+  batchCategorize, 
+  learnFromCorrection, 
+  CATEGORIES,
+  normalizeMerchant 
+} from "../smartCategorization";
 
 /**
- * Create SQL Query Tool - Executes read-only SQL queries against the transactions database
+ * Create SQL Query Tool - Executes read-only SQL queries against the Postgres database
  * Automatically filters by user_id for security
  */
 export function createSqlQueryTool(userId: string) {
   return tool(
     async ({ query }: { query: string }): Promise<string> => {
       try {
-        // Security: Only allow SELECT statements
-        const normalizedQuery = query.trim().toUpperCase();
-        if (!normalizedQuery.startsWith("SELECT")) {
-          return JSON.stringify({
-            error: "Only SELECT queries are allowed for security reasons.",
-            success: false,
-          });
-        }
-
-        // Security: Inject user_id filter into the query
-        // Replace FROM transactions with FROM transactions WHERE user_id = 'userId'
-        // Or add AND user_id = 'userId' if WHERE already exists
-        let secureQuery = query;
-        const fromTransactionsRegex = /FROM\s+transactions\b/gi;
-        const hasWhere = /FROM\s+transactions\s+WHERE/gi.test(query);
-        
-        if (fromTransactionsRegex.test(query)) {
-          if (hasWhere) {
-            // Add user_id condition after WHERE
-            secureQuery = query.replace(
-              /FROM\s+transactions\s+WHERE/gi,
-              `FROM transactions WHERE user_id = '${userId}' AND`
-            );
-          } else {
-            // Add WHERE clause with user_id
-            secureQuery = query.replace(
-              /FROM\s+transactions\b/gi,
-              `FROM transactions WHERE user_id = '${userId}'`
-            );
-          }
-        }
-
-        // Execute the query
-        const stmt = db.prepare(secureQuery);
-        const results = stmt.all();
+        const results = await executeRawQuery(userId, query);
 
         return JSON.stringify({
           success: true,
           rowCount: results.length,
           data: results.slice(0, 100), // Limit to 100 rows
-          query: secureQuery,
+          query: query,
         });
       } catch (error) {
         return JSON.stringify({
@@ -66,32 +51,34 @@ export function createSqlQueryTool(userId: string) {
     },
     {
       name: "sql_query",
-      description: `Execute a read-only SQL query against the SQLite transactions database.
+      description: `Execute a read-only SQL query against the PostgreSQL transactions database.
       
 The database has the following schema:
 
 TABLE: transactions
-- id: INTEGER PRIMARY KEY
+- id: SERIAL PRIMARY KEY
+- user_id: TEXT (user identifier)
 - date: TEXT (format: YYYY-MM-DD)
 - description: TEXT (merchant/transaction description)
 - amount: REAL (negative for expenses, positive for income)
-- category: TEXT (e.g., 'Coffee', 'Groceries', 'Dining', 'Transportation', 'Entertainment', 'Shopping', 'Healthcare', 'Income', 'Transfer', etc.)
+- category: TEXT (e.g., 'Coffee', 'Groceries', 'Dining', 'Transportation', etc.)
 - account: TEXT (optional account name)
 - transaction_type: TEXT ('expense' or 'income')
-- created_at: TEXT (timestamp)
+- created_at: TIMESTAMP
 
 TABLE: category_rules
-- id: INTEGER PRIMARY KEY
+- id: SERIAL PRIMARY KEY
 - pattern: TEXT (merchant pattern to match)
 - category: TEXT (category to assign)
-- created_at: TEXT
+- created_at: TIMESTAMP
 
-IMPORTANT TIPS:
+IMPORTANT TIPS (PostgreSQL syntax):
 - Use ABS(amount) when summing expenses to get positive totals
-- Use strftime('%Y-%m', date) for monthly grouping
-- Use date('now') for current date, date('now', 'start of month') for month start
-- Category names are case-sensitive
-- For comparisons, use date('now', '-1 month', 'start of month') for last month
+- Use TO_CHAR(date::date, 'YYYY-MM') for monthly grouping
+- Use CURRENT_DATE for current date
+- Use DATE_TRUNC('month', CURRENT_DATE) for month start
+- Use CURRENT_DATE - INTERVAL '1 month' for date arithmetic
+- Use ILIKE for case-insensitive matching
 - DO NOT include user_id in your queries - it is automatically filtered
 
 Only SELECT queries are allowed.`,
@@ -109,15 +96,7 @@ export function createGetCategoresTool(userId: string) {
   return tool(
     async (): Promise<string> => {
       try {
-        const stmt = db.prepare(`
-          SELECT DISTINCT category, COUNT(*) as count, 
-                 ROUND(ABS(SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END)), 2) as total_spent
-          FROM transactions 
-          WHERE category IS NOT NULL AND user_id = ?
-          GROUP BY category
-          ORDER BY count DESC
-        `);
-        const categories = stmt.all(userId);
+        const categories = await getSpendingByCategory(userId, 50);
 
         return JSON.stringify({
           success: true,
@@ -146,43 +125,35 @@ export function createGetSummaryTool(userId: string) {
   return tool(
     async ({ timeframe }: { timeframe?: string }): Promise<string> => {
       try {
-        let dateFilter = "";
+        // Calculate date range based on timeframe
+        let dateFilter: { start: string; end: string } | undefined;
+        const today = new Date().toISOString().split('T')[0];
+        
         if (timeframe === "this_month") {
-          dateFilter = "AND date >= date('now', 'start of month')";
+          const start = new Date();
+          start.setDate(1);
+          dateFilter = { start: start.toISOString().split('T')[0], end: today };
         } else if (timeframe === "last_month") {
-          dateFilter = "AND date >= date('now', '-1 month', 'start of month') AND date < date('now', 'start of month')";
+          const end = new Date();
+          end.setDate(0); // Last day of previous month
+          const start = new Date(end);
+          start.setDate(1);
+          dateFilter = { 
+            start: start.toISOString().split('T')[0], 
+            end: end.toISOString().split('T')[0] 
+          };
         } else if (timeframe === "this_year") {
-          dateFilter = "AND date >= date('now', 'start of year')";
+          const start = new Date();
+          start.setMonth(0, 1);
+          dateFilter = { start: start.toISOString().split('T')[0], end: today };
         } else if (timeframe === "last_30_days") {
-          dateFilter = "AND date >= date('now', '-30 days')";
+          const start = new Date();
+          start.setDate(start.getDate() - 30);
+          dateFilter = { start: start.toISOString().split('T')[0], end: today };
         }
 
-        const stmt = db.prepare(`
-          SELECT 
-            COUNT(*) as total_transactions,
-            ROUND(ABS(SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END)), 2) as total_expenses,
-            ROUND(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 2) as total_income,
-            ROUND(SUM(amount), 2) as net_savings,
-            MIN(date) as earliest_date,
-            MAX(date) as latest_date,
-            ROUND(AVG(CASE WHEN amount < 0 THEN ABS(amount) ELSE NULL END), 2) as avg_expense
-          FROM transactions
-          WHERE user_id = ? ${dateFilter}
-        `);
-        const summary = stmt.get(userId);
-
-        // Get top categories
-        const topCategoriesStmt = db.prepare(`
-          SELECT category, 
-                 ROUND(ABS(SUM(amount)), 2) as total,
-                 COUNT(*) as count
-          FROM transactions 
-          WHERE amount < 0 AND user_id = ? ${dateFilter}
-          GROUP BY category
-          ORDER BY total DESC
-          LIMIT 5
-        `);
-        const topCategories = topCategoriesStmt.all(userId);
+        const summary = await getFinancialSummary(userId, dateFilter);
+        const topCategories = await getSpendingByCategory(userId, 5);
 
         return JSON.stringify({
           success: true,
@@ -217,20 +188,7 @@ export function createGetMonthlyTrendsTool(userId: string) {
     async ({ months }: { months?: number }): Promise<string> => {
       try {
         const limit = months || 6;
-        
-        const stmt = db.prepare(`
-          SELECT 
-            strftime('%Y-%m', date) as month,
-            ROUND(ABS(SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END)), 2) as expenses,
-            ROUND(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 2) as income,
-            COUNT(*) as transaction_count
-          FROM transactions
-          WHERE date >= date('now', '-' || ? || ' months') AND user_id = ?
-          GROUP BY strftime('%Y-%m', date)
-          ORDER BY month DESC
-          LIMIT ?
-        `);
-        const trends = stmt.all(limit, userId, limit);
+        const trends = await getMonthlyTrends(userId, limit);
 
         return JSON.stringify({
           success: true,
@@ -263,34 +221,30 @@ export function createSearchTransactionsTool(userId: string) {
       try {
         const maxResults = Math.min(limit || 20, 50);
         
-        let whereClause = "WHERE user_id = ?";
-        const params: (string | number)[] = [userId];
-        
+        let transactions;
         if (searchTerm) {
-          whereClause += " AND LOWER(description) LIKE LOWER(?)";
-          params.push(`%${searchTerm}%`);
+          transactions = await searchTransactions(userId, searchTerm, maxResults);
+        } else {
+          transactions = await getTransactions(userId, maxResults);
         }
-        
+
+        // Filter by category if specified
         if (category) {
-          whereClause += " AND LOWER(category) = LOWER(?)";
-          params.push(category);
+          transactions = transactions.filter(
+            t => t.category?.toLowerCase() === category.toLowerCase()
+          );
         }
-        
-        const stmt = db.prepare(`
-          SELECT id, date, description, amount, category
-          FROM transactions
-          ${whereClause}
-          ORDER BY date DESC
-          LIMIT ?
-        `);
-        params.push(maxResults);
-        
-        const transactions = stmt.all(...params);
 
         return JSON.stringify({
           success: true,
           count: transactions.length,
-          transactions: transactions,
+          transactions: transactions.map(t => ({
+            id: t.id,
+            date: t.date,
+            description: t.description,
+            amount: t.amount,
+            category: t.category,
+          })),
         });
       } catch (error) {
         return JSON.stringify({
@@ -318,55 +272,58 @@ export function createComparePeriodsTool(userId: string) {
   return tool(
     async ({ period1, period2, category }: { period1: string; period2: string; category?: string }): Promise<string> => {
       try {
-        const getPeriodData = (period: string, cat?: string) => {
-          let dateFilter = "";
+        const getDateRange = (period: string): { start: string; end: string } => {
+          const today = new Date();
+          
           if (period === "this_month") {
-            dateFilter = "date >= date('now', 'start of month')";
+            const start = new Date(today.getFullYear(), today.getMonth(), 1);
+            return { 
+              start: start.toISOString().split('T')[0], 
+              end: today.toISOString().split('T')[0] 
+            };
           } else if (period === "last_month") {
-            dateFilter = "date >= date('now', '-1 month', 'start of month') AND date < date('now', 'start of month')";
+            const end = new Date(today.getFullYear(), today.getMonth(), 0);
+            const start = new Date(end.getFullYear(), end.getMonth(), 1);
+            return { 
+              start: start.toISOString().split('T')[0], 
+              end: end.toISOString().split('T')[0] 
+            };
           } else if (period === "this_week") {
-            dateFilter = "date >= date('now', 'weekday 0', '-7 days')";
-          } else if (period === "last_week") {
-            dateFilter = "date >= date('now', 'weekday 0', '-14 days') AND date < date('now', 'weekday 0', '-7 days')";
+            const dayOfWeek = today.getDay();
+            const start = new Date(today);
+            start.setDate(today.getDate() - dayOfWeek);
+            return { 
+              start: start.toISOString().split('T')[0], 
+              end: today.toISOString().split('T')[0] 
+            };
+          } else { // last_week
+            const dayOfWeek = today.getDay();
+            const end = new Date(today);
+            end.setDate(today.getDate() - dayOfWeek - 1);
+            const start = new Date(end);
+            start.setDate(end.getDate() - 6);
+            return { 
+              start: start.toISOString().split('T')[0], 
+              end: end.toISOString().split('T')[0] 
+            };
           }
-          
-          let categoryFilter = "";
-          if (cat) {
-            categoryFilter = `AND LOWER(category) = LOWER('${cat}')`;
-          }
-          
-          const stmt = db.prepare(`
-            SELECT 
-              ROUND(ABS(SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END)), 2) as expenses,
-              ROUND(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 2) as income,
-              COUNT(*) as count
-            FROM transactions
-            WHERE ${dateFilter} AND user_id = ? ${categoryFilter}
-          `);
-          return stmt.get(userId);
         };
-        
-        const data1 = getPeriodData(period1, category);
-        const data2 = getPeriodData(period2, category);
 
-        interface PeriodData {
-          expenses: number;
-          income: number;
-          count: number;
-        }
+        const range1 = getDateRange(period1);
+        const range2 = getDateRange(period2);
 
-        const p1 = data1 as PeriodData;
-        const p2 = data2 as PeriodData;
+        const data1 = await getFinancialSummary(userId, range1);
+        const data2 = await getFinancialSummary(userId, range2);
 
-        const expenseChange = p1.expenses && p2.expenses 
-          ? ((p1.expenses - p2.expenses) / p2.expenses * 100).toFixed(1)
+        const expenseChange = data1.totalExpenses && data2.totalExpenses 
+          ? ((Number(data1.totalExpenses) - Number(data2.totalExpenses)) / Number(data2.totalExpenses) * 100).toFixed(1)
           : null;
 
         return JSON.stringify({
           success: true,
           comparison: {
-            period1: { name: period1, ...p1 },
-            period2: { name: period2, ...p2 },
+            period1: { name: period1, ...data1 },
+            period2: { name: period2, ...data2 },
             expenseChangePercent: expenseChange,
             category: category || "all",
           },
@@ -394,7 +351,7 @@ export function createComparePeriodsTool(userId: string) {
 
 /**
  * Create RAG Retrieval Tool - Retrieves similar transactions and context for a query
- * Uses embeddings and vector similarity search
+ * Uses pgvector embeddings and vector similarity search
  */
 export function createRetrievalTool(userId: string) {
   return tool(
@@ -434,14 +391,14 @@ export function createRetrievalTool(userId: string) {
     },
     {
       name: "retrieve_context",
-      description: `Search for similar transactions and relevant context using semantic similarity.
+      description: `Search for similar transactions and relevant context using semantic similarity (pgvector).
 Use this tool to:
 - Find transactions similar to a description
 - Get context about past spending patterns
 - Find examples of how similar queries were answered
 - Understand categorization patterns
 
-This uses RAG (Retrieval-Augmented Generation) to find semantically similar data.`,
+This uses RAG (Retrieval-Augmented Generation) with pgvector for fast similarity search.`,
       schema: z.object({
         query: z.string().describe("The search query or transaction description to find similar items for"),
         topK: z.number().optional().describe("Number of results to return (default: 5)"),
@@ -471,10 +428,12 @@ export function createSimilarTransactionsTool(userId: string) {
         // Get most common category from similar transactions
         const categoryCounts: Record<string, number> = {};
         for (const tx of similar) {
-          categoryCounts[tx.category] = (categoryCounts[tx.category] || 0) + 1;
+          if (tx.category) {
+            categoryCounts[tx.category] = (categoryCounts[tx.category] || 0) + 1;
+          }
         }
         const suggestedCategory = Object.entries(categoryCounts)
-          .sort((a, b) => b[1] - a[1])[0][0];
+          .sort((a, b) => b[1] - a[1])[0]?.[0] || 'Unknown';
 
         return JSON.stringify({
           success: true,
@@ -491,9 +450,175 @@ export function createSimilarTransactionsTool(userId: string) {
     },
     {
       name: "find_similar_transactions",
-      description: "Find transactions similar to a given description. Useful for predicting categories or understanding spending patterns.",
+      description: "Find transactions similar to a given description using pgvector similarity. Useful for predicting categories or understanding spending patterns.",
       schema: z.object({
         description: z.string().describe("The transaction description to find similar items for"),
+      }),
+    }
+  );
+}
+
+/**
+ * Create Preview Categorization Tool - Preview what category would be assigned to a merchant
+ */
+export function createPreviewCategorizationTool() {
+  return tool(
+    async ({ description }: { description: string }): Promise<string> => {
+      try {
+        const result = await smartCategorize(description);
+        
+        return JSON.stringify({
+          success: true,
+          originalDescription: description,
+          normalizedMerchant: result.normalizedMerchant,
+          category: result.category,
+          confidence: result.confidence,
+          method: result.method,
+          suggestRule: result.suggestRule,
+          availableCategories: CATEGORIES,
+        });
+      } catch (error) {
+        return JSON.stringify({
+          success: false,
+          error: error instanceof Error ? error.message : "Failed to preview categorization",
+        });
+      }
+    },
+    {
+      name: "preview_categorization",
+      description: `Preview what category would be assigned to a merchant/transaction description.
+Uses the smart categorization system which:
+1. First checks for exact rule matches from learned patterns
+2. Then uses extended pattern matching for common merchants
+3. Finally falls back to AI (GPT-4o-mini) for unrecognized merchants
+
+Returns the category, confidence level (high/medium/low), and which method was used.`,
+      schema: z.object({
+        description: z.string().describe("The merchant name or transaction description to categorize"),
+      }),
+    }
+  );
+}
+
+/**
+ * Create Recategorize Transactions Tool - Recategorize transactions using smart categorization
+ */
+export function createRecategorizeTool(userId: string) {
+  return tool(
+    async ({ onlyOther, limit }: { onlyOther?: boolean; limit?: number }): Promise<string> => {
+      try {
+        // Get transactions to recategorize
+        const transactions = await getTransactions(userId, limit || 100);
+        
+        const toProcess = onlyOther 
+          ? transactions.filter(t => t.category === 'Other')
+          : transactions;
+        
+        if (toProcess.length === 0) {
+          return JSON.stringify({
+            success: true,
+            message: onlyOther 
+              ? "No transactions with 'Other' category found."
+              : "No transactions found to recategorize.",
+            updated: 0,
+          });
+        }
+
+        // Batch categorize
+        const descriptions = toProcess.map(t => t.description);
+        const results = await batchCategorize(descriptions);
+
+        // Count method usage
+        const methodCounts: Record<string, number> = {};
+        const categoryChanges: Array<{ id: number; old: string; new: string; method: string }> = [];
+        
+        for (let i = 0; i < toProcess.length; i++) {
+          const tx = toProcess[i];
+          const result = results[i];
+          methodCounts[result.method] = (methodCounts[result.method] || 0) + 1;
+          
+          if (tx.category !== result.category) {
+            categoryChanges.push({
+              id: tx.id,
+              old: tx.category || 'Unknown',
+              new: result.category,
+              method: result.method,
+            });
+          }
+        }
+
+        return JSON.stringify({
+          success: true,
+          analyzed: toProcess.length,
+          wouldChange: categoryChanges.length,
+          methodUsage: methodCounts,
+          changes: categoryChanges.slice(0, 20), // Preview first 20
+          note: "This is a preview. Use the /api/recategorize endpoint to apply changes.",
+        });
+      } catch (error) {
+        return JSON.stringify({
+          success: false,
+          error: error instanceof Error ? error.message : "Failed to recategorize",
+        });
+      }
+    },
+    {
+      name: "recategorize_transactions",
+      description: `Analyze transactions and preview what categories would be assigned using the smart categorization system.
+This tool previews changes but doesn't apply them - it shows what WOULD change.
+Set onlyOther to true to only analyze transactions currently categorized as "Other".
+Use this when users ask to "fix categories" or "recategorize".`,
+      schema: z.object({
+        onlyOther: z.boolean().optional().describe("Only recategorize transactions with 'Other' category"),
+        limit: z.number().optional().describe("Maximum transactions to analyze (default: 100)"),
+      }),
+    }
+  );
+}
+
+/**
+ * Create Learn Category Tool - Create a categorization rule from a user correction
+ */
+export function createLearnCategoryTool() {
+  return tool(
+    async ({ description, category }: { description: string; category: string }): Promise<string> => {
+      try {
+        // Validate category (case-insensitive check)
+        const validCategory = CATEGORIES.find(c => c.toLowerCase() === category.toLowerCase());
+        if (!validCategory) {
+          return JSON.stringify({
+            success: false,
+            error: `Invalid category. Available categories: ${CATEGORIES.join(', ')}`,
+          });
+        }
+
+        const result = await learnFromCorrection(description, validCategory, true);
+        
+        return JSON.stringify({
+          success: true,
+          ruleCreated: result.ruleCreated,
+          pattern: result.pattern,
+          category: validCategory,
+          message: result.ruleCreated 
+            ? `Created rule: "${result.pattern}" → ${validCategory}. Future transactions matching this pattern will be auto-categorized.`
+            : `Rule already exists for this pattern.`,
+        });
+      } catch (error) {
+        return JSON.stringify({
+          success: false,
+          error: error instanceof Error ? error.message : "Failed to learn category",
+        });
+      }
+    },
+    {
+      name: "learn_category",
+      description: `Create a categorization rule from a user correction.
+When a user says something like "Starbucks should be Coffee" or "mark XYZ as Groceries",
+use this tool to create a rule so future transactions are auto-categorized.
+The pattern is automatically normalized (prefixes like SQ*, PP* are stripped).`,
+      schema: z.object({
+        description: z.string().describe("The merchant name or transaction description"),
+        category: z.string().describe("The correct category to assign"),
       }),
     }
   );
@@ -512,8 +637,11 @@ export function createFinanceTools(userId: string) {
     createComparePeriodsTool(userId),
     createRetrievalTool(userId),
     createSimilarTransactionsTool(userId),
+    createPreviewCategorizationTool(),
+    createRecategorizeTool(userId),
+    createLearnCategoryTool(),
   ];
 }
 
-// For backward compatibility, export a default set (though these should not be used directly)
+// For backward compatibility
 export const financeTools = createFinanceTools("");
