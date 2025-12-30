@@ -1,4 +1,4 @@
-# Personal Finance Auto-Pilot
+# FindMind: Personal Finance Auto-Pilot
 
 An AI Agent-powered financial assistant that allows users to upload bank statements (CSV) and chat with their data using natural language. The system autonomously categorizes transactions and generates SQL queries to answer your financial questions.
 
